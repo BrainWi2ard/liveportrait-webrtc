@@ -106,7 +106,7 @@ export function useLivePortrait(signalingUrl: string): UseLivePortraitReturn {
           throw new Error('Failed to initialize session');
         }
 
-        // Initialize WebRTC client
+        // Initialize WebRTC client with privacy shield enabled
         webrtcClientRef.current = new WebRTCClient(
           sessionData.sessionId,
           signalingUrl,

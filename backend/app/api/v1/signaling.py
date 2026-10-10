@@ -1,57 +1,80 @@
-"""WebRTC signaling via WebSocket."""
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, status
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
+"""WebRTC signaling via WebSocket with telemetry inspection and privacy filtering."""
 import json
 import logging
 from datetime import datetime
+from typing import Any, Dict
+
 import httpx
-from app.database import get_session
-from app.models import User, CallSession, CallStatusEnum
-from app.schemas import SDPOfferPayload, SDPAnswerPayload, ICECandidatePayload
-from app.api.v1.auth import get_current_user
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
+from fastapi.websockets import WebSocketState
+from sqlalchemy import select
+
 from app.config import settings
 
 router = APIRouter(tags=["signaling"])
 logger = logging.getLogger(__name__)
 
-# Active WebSocket connections mapping: session_id -> WebSocket
-active_connections: dict[str, WebSocket] = {}
+connections: Dict[str, WebSocket] = {}
+
+# Known tracker/analytics domains blocklist for telemetry inspection
+TELEMETRY_BLOCKLIST = [
+    "google-analytics.com",
+    "analytics.google.com",
+    "telemetry.browser",
+    "segment.io",
+    "crashlytics.com",
+    "firebase.google.com",
+    "metrics.backend",
+    "tracking.service",
+    "telemetry.service",
+    "mixpanel.com",
+    "amplitude.com",
+    "intercom.io",
+    "sentry.io",
+    "rollbar.com",
+    "datadog.com",
+    "newrelic.com",
+]
 
 
-class ConnectionManager:
-    """Manage WebSocket connections for signaling."""
-    
-    def __init__(self):
-        self.active_connections: dict[str, WebSocket] = {}
-    
-    async def connect(self, session_id: str, websocket: WebSocket):
-        """Register new connection."""
-        await websocket.accept()
-        self.active_connections[session_id] = websocket
-        logger.info(f"WebSocket connected: {session_id}")
-    
-    def disconnect(self, session_id: str):
-        """Unregister connection."""
-        if session_id in self.active_connections:
-            del self.active_connections[session_id]
-            logger.info(f"WebSocket disconnected: {session_id}")
-    
-    async def send_message(self, session_id: str, message: dict):
-        """Send message to connected client."""
-        if session_id in self.active_connections:
-            await self.active_connections[session_id].send_json(message)
-    
-    async def broadcast(self, message: dict):
-        """Broadcast message to all connected clients."""
-        for conn in self.active_connections.values():
-            try:
-                await conn.send_json(message)
-            except Exception as e:
-                logger.error(f"Broadcast error: {e}")
+def inspect_and_filter_telemetry(payload: Dict[str, Any]) -> bool:
+    """
+    Screens outbound signaling and telemetry payloads against known tracker domains.
+    Implements privacy protection by dropping unauthorized telemetry streams.
+    Inspired by FF-Shield inspection rules.
 
+    Args:
+        payload: Dictionary containing potential telemetry data
 
-connection_manager = ConnectionManager()
+    Returns:
+        True if payload passes inspection, False if it should be dropped
+    """
+    # Convert payload to string for domain scanning
+    payload_str = json.dumps(payload).lower()
+
+    # Check for blocklisted domains
+    for domain in TELEMETRY_BLOCKLIST:
+        if domain.lower() in payload_str:
+            logger.warning(f"Telemetry inspection: Blocked payload containing {domain}")
+            return False
+
+    # Check for suspicious URL patterns
+    suspicious_patterns = [
+        r"https?://.*analytics",
+        r"https?://.*telemetry",
+        r"https?://.*tracking",
+        r"https?://.*metrics",
+        r"beacon:",
+    ]
+
+    import re
+
+    for pattern in suspicious_patterns:
+        if re.search(pattern, payload_str, re.IGNORECASE):
+            logger.warning(f"Telemetry inspection: Blocked payload matching pattern {pattern}")
+            return False
+
+    return True
 
 
 async def proxy_to_gpu_worker(payload: dict) -> dict:
@@ -60,11 +83,11 @@ async def proxy_to_gpu_worker(payload: dict) -> dict:
         "Authorization": f"Bearer {settings.gpu_worker_api_key}",
         "Content-Type": "application/json",
     }
-    
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
-                f"{settings.gpu_worker_base_url}/process",
+                f"{settings.gpu_worker_base_url}/api/v1/proxy",
                 json=payload,
                 headers=headers,
             )
@@ -76,99 +99,106 @@ async def proxy_to_gpu_worker(payload: dict) -> dict:
 
 
 @router.websocket("/ws/stream/{session_id}")
-async def websocket_signaling_endpoint(
-    websocket: WebSocket,
-    session_id: str,
-    token: str,
-):
-    """WebSocket endpoint for WebRTC signaling and GPU stream coordination."""
-    # Validate token and get user
-    try:
-        # Note: In production, implement proper token validation here
-        # For now, we trust the token is valid
-        pass
-    except Exception as e:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-    
-    # Register connection
-    await connection_manager.connect(session_id, websocket)
-    
+async def websocket_stream(websocket: WebSocket, session_id: str):
+    """
+    WebSocket endpoint for WebRTC signaling and GPU stream coordination.
+    Includes telemetry inspection and privacy filtering.
+    """
+    await websocket.accept()
+    connections[session_id] = websocket
+    logger.info(f"WebSocket stream connection established: {session_id}")
+
     try:
         while True:
             # Receive message from client
-            data = await websocket.receive_json()
-            message_type = data.get("type")
-            
+            raw = await websocket.receive_text()
+            message = json.loads(raw)
+
+            message_type = message.get("type")
+            logger.debug(f"Received signaling message type: {message_type}")
+
+            # Inspect payload for telemetry/tracking before processing
+            if not inspect_and_filter_telemetry(message):
+                logger.warning(f"Dropping message due to telemetry inspection: {message_type}")
+                await websocket.send_json(
+                    {
+                        "type": "inspection_rejected",
+                        "session_id": session_id,
+                        "reason": "Payload contained blocked telemetry",
+                    }
+                )
+                continue
+
             if message_type == "sdp_offer":
                 # Handle SDP offer
-                payload = SDPOfferPayload(**data)
-                
-                # Create or retrieve call session
-                # Note: In production, implement proper session management
-                
-                # Proxy to GPU worker
-                gpu_payload = {
+                payload = {
                     "type": "sdp_offer",
-                    "sdp": payload.sdp,
-                    "session_id": payload.session_id,
-                    "target_asset_id": payload.target_asset_id,
+                    "session_id": session_id,
+                    "sdp": message.get("sdp"),
+                    "target_asset_id": message.get("target_asset_id"),
                 }
-                
-                gpu_response = await proxy_to_gpu_worker(gpu_payload)
-                
+
+                gpu_response = await proxy_to_gpu_worker(payload)
+
                 if "error" not in gpu_response:
-                    # Forward GPU response back to client
-                    await connection_manager.send_message(
-                        session_id,
-                        {
-                            "type": "sdp_answer",
-                            "sdp": gpu_response.get("sdp"),
-                            "session_id": session_id,
-                        }
-                    )
-            
+                    # Forward GPU response back to client (after inspection)
+                    response = {
+                        "type": "sdp_answer",
+                        "sdp": gpu_response.get("sdp"),
+                        "session_id": session_id,
+                    }
+
+                    if inspect_and_filter_telemetry(response):
+                        await websocket.send_json(response)
+                    else:
+                        logger.warning("GPU response failed telemetry inspection")
+
             elif message_type == "ice_candidate":
-                # Handle ICE candidate
-                payload = ICECandidatePayload(**data)
-                
-                # Proxy to GPU worker
-                gpu_payload = {
+                # Handle ICE candidate (with privacy protection)
+                candidate_str = message.get("candidate", "")
+
+                # Additional privacy check: filter local IP leaks at backend
+                if any(
+                    pattern in candidate_str.lower()
+                    for pattern in ["192.168", "10.0", "172.16", "127.0"]
+                ):
+                    logger.debug("PrivacyShield: Dropped local IP leak in ICE candidate")
+                    continue
+
+                payload = {
                     "type": "ice_candidate",
-                    "candidate": payload.candidate,
-                    "sdpMLineIndex": payload.sdpMLineIndex,
-                    "sdpMid": payload.sdpMid,
-                    "session_id": payload.session_id,
+                    "session_id": session_id,
+                    "candidate": candidate_str,
+                    "sdpMLineIndex": message.get("sdpMLineIndex"),
+                    "sdpMid": message.get("sdpMid"),
                 }
-                
-                await proxy_to_gpu_worker(gpu_payload)
-            
+
+                await proxy_to_gpu_worker(payload)
+
             elif message_type == "asset_switch":
                 # Handle dynamic asset switching
-                target_asset_id = data.get("target_asset_id")
-                
-                gpu_payload = {
+                target_asset_id = message.get("target_asset_id")
+
+                payload = {
                     "type": "asset_switch",
                     "session_id": session_id,
                     "target_asset_id": target_asset_id,
                 }
-                
-                gpu_response = await proxy_to_gpu_worker(gpu_payload)
-                
+
+                gpu_response = await proxy_to_gpu_worker(payload)
+
                 # Confirm asset switch
-                await connection_manager.send_message(
-                    session_id,
+                await websocket.send_json(
                     {
                         "type": "asset_switched",
                         "target_asset_id": target_asset_id,
                         "success": "error" not in gpu_response,
                     }
                 )
-            
+
             elif message_type == "diagnostics_request":
-                # Return mock diagnostics for now
-                await connection_manager.send_message(
-                    session_id,
+                # Return diagnostics (mock data for local iteration)
+                await websocket.send_json(
                     {
                         "type": "diagnostics",
                         "fps": 30.0,
@@ -178,10 +208,14 @@ async def websocket_signaling_endpoint(
                         "timestamp": datetime.utcnow().isoformat(),
                     }
                 )
-    
+
     except WebSocketDisconnect:
-        connection_manager.disconnect(session_id)
-        logger.info(f"Client {session_id} disconnected")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        connection_manager.disconnect(session_id)
+        connections.pop(session_id, None)
+        logger.info(f"WebSocket stream disconnected: {session_id}")
+    except Exception as exc:
+        logger.error(f"WebSocket error: {exc}")
+        connections.pop(session_id, None)
+        try:
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        except Exception:
+            pass
