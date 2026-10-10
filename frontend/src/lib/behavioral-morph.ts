@@ -1,160 +1,146 @@
 /**
  * behavioral-morph.ts
  * Simulates non-stationary human motor control properties (fatigue, attention decay,
- * micro-tremors) using a Markov state machine.
- * Defeats statistical behavioral classifiers looking for stationary bot patterns.
+ * micro-tremors) using a Markov chain state machine.
+ * Defeats statistical behavioral classifiers looking for bot/automation patterns.
  */
 
 export type FatigueState = "ALERT" | "FOCUSED" | "FATIGUED" | "DISTRACTED";
 
-export interface BehavioralState {
+export interface StateInfo {
   state: FatigueState;
   timeOnDevice: number;
   tremorScale: number;
-  attentionDrift: number;
+  focusDrift: number;
+  latencyModulation: number;
 }
 
+/**
+ * Markov-driven kinematic morphing engine.
+ * Dynamically modulates mouse kinematics, pointer tremor frequencies,
+ * and UI interaction latency profiles to defeat behavioral classifiers.
+ */
 export class BehavioralMorphEngine {
   private currentState: FatigueState = "ALERT";
   private timeOnDeviceSec: number = 0;
   private tremorScale: number = 1.0;
-  private attentionDrift: number = 0.0;
-  private stateUpdateInterval: NodeJS.Timeout | null = null;
-  private enabled: boolean = true;
+  private focusDrift: number = 0.0;
+  private latencyModulation: number = 1.0;
+  private stateTransitionTimer: number | null = null;
+  private focusDriftAccumulator: number = 0;
 
-  constructor(enabled: boolean = true) {
-    this.enabled = enabled;
-
-    // Initialize state machine timer (only in browser environment)
+  constructor() {
+    // Start the Markov state machine update loop
     if (typeof window !== "undefined") {
-      this.stateUpdateInterval = setInterval(() => {
+      this.stateTransitionTimer = window.setInterval(() => {
         this.timeOnDeviceSec += 1;
         this.updateMarkovState();
+        this.updateFocusDrift();
       }, 1000);
     }
   }
 
   /**
-   * Update Markov state based on session duration and simulated attention.
-   * Transitions between states with realistic human-like patterns.
+   * Update Markov state based on session duration.
+   * Simulates realistic human fatigue/attention patterns.
    */
   private updateMarkovState(): void {
-    if (!this.enabled) return;
-
-    // Simulate attention drift (random walk)
-    this.attentionDrift = Math.max(
-      -1.0,
-      Math.min(1.0, this.attentionDrift + (Math.random() - 0.5) * 0.1)
-    );
-
-    // State transitions based on time-on-device
+    // State transition probabilities based on time-on-device
     if (this.timeOnDeviceSec > 600) {
-      // 10+ minutes: High fatigue
       this.currentState = "FATIGUED";
       this.tremorScale = 2.4;
+      this.latencyModulation = 1.5;
     } else if (this.timeOnDeviceSec > 300) {
-      // 5-10 minutes: Distraction sets in
       this.currentState = "DISTRACTED";
       this.tremorScale = 1.8;
+      this.latencyModulation = 1.25;
     } else if (this.timeOnDeviceSec > 60) {
-      // 1-5 minutes: Peak focus
       this.currentState = "FOCUSED";
       this.tremorScale = 1.2;
+      this.latencyModulation = 1.0;
     } else {
-      // 0-1 minute: Alert state
       this.currentState = "ALERT";
       this.tremorScale = 1.0;
+      this.latencyModulation = 0.95;
     }
+  }
+
+  /**
+   * Simulate attention drift (looking away from screen, refocusing).
+   * Creates realistic variation in mouse movement precision.
+   */
+  private updateFocusDrift(): void {
+    this.focusDriftAccumulator += (Math.random() - 0.5) * 0.1;
+    this.focusDrift = Math.sin(this.focusDriftAccumulator) * 0.2;
   }
 
   /**
    * Modulates input coordinates with state-dependent kinematic tremors.
-   * Simulates natural human motor control variability.
+   * Applies realistic human motor control variability.
    *
    * @param x - Original X coordinate
    * @param y - Original Y coordinate
-   * @returns Morphed coordinates with tremor and attention-based drift
+   * @returns Morphed coordinates with tremor applied
    */
   morphKinematics(x: number, y: number): { x: number; y: number } {
-    if (!this.enabled) return { x, y };
+    const randomTremorX = (Math.random() - 0.5) * this.tremorScale;
+    const randomTremorY = (Math.random() - 0.5) * this.tremorScale;
 
-    // Generate state-dependent tremor magnitude
-    const baseNoise = (Math.random() - 0.5) * 2.0; // Range: [-1, 1]
-    const stateMultiplier = this.tremorScale;
-    const attentionFactor = 1.0 + this.attentionDrift * 0.5; // Range: [0.5, 1.5]
-
-    const randomTremorX = baseNoise * stateMultiplier * attentionFactor;
-    const randomTremorY = baseNoise * stateMultiplier * attentionFactor * 0.8; // Slight Y bias
+    // Apply focus drift to reduce precision over time
+    const driftedX = x + this.focusDrift * 5;
+    const driftedY = y + this.focusDrift * 5;
 
     return {
-      x: x + randomTremorX,
-      y: y + randomTremorY,
+      x: driftedX + randomTremorX,
+      y: driftedY + randomTremorY,
     };
   }
 
   /**
-   * Calculate interaction latency based on current state.
-   * Simulates realistic human response times.
+   * Calculate reaction time delay with state-dependent modulation.
+   * Simulates realistic human response latency.
    *
-   * @returns Latency in milliseconds
+   * @param baseLatencyMs - Base reaction time (typically 200-400ms)
+   * @returns Modulated latency in milliseconds
    */
-  getInteractionLatency(): number {
-    if (!this.enabled) return 0;
-
-    let baseLatency = 0;
-    switch (this.currentState) {
-      case "ALERT":
-        baseLatency = 150 + Math.random() * 50; // 150-200ms
-        break;
-      case "FOCUSED":
-        baseLatency = 180 + Math.random() * 70; // 180-250ms
-        break;
-      case "DISTRACTED":
-        baseLatency = 250 + Math.random() * 150; // 250-400ms
-        break;
-      case "FATIGUED":
-        baseLatency = 350 + Math.random() * 200; // 350-550ms
-        break;
-    }
-    return Math.round(baseLatency);
+  getReactionTimeDelay(baseLatencyMs: number = 250): number {
+    // Add state-dependent jitter
+    const jitter = (Math.random() - 0.5) * 50 * this.latencyModulation;
+    return baseLatencyMs * this.latencyModulation + jitter;
   }
 
   /**
-   * Get current behavioral state information.
+   * Get current state information for debugging/monitoring.
+   * @returns Current behavioral state snapshot
    */
-  getStateInfo(): BehavioralState {
+  getStateInfo(): StateInfo {
     return {
       state: this.currentState,
       timeOnDevice: this.timeOnDeviceSec,
       tremorScale: this.tremorScale,
-      attentionDrift: this.attentionDrift,
+      focusDrift: this.focusDrift,
+      latencyModulation: this.latencyModulation,
     };
   }
 
   /**
-   * Reset the session timer (e.g., on user interaction).
+   * Reset the behavioral engine (e.g., on new session).
    */
-  resetSession(): void {
-    this.timeOnDeviceSec = 0;
+  reset(): void {
     this.currentState = "ALERT";
+    this.timeOnDeviceSec = 0;
     this.tremorScale = 1.0;
-    this.attentionDrift = 0.0;
+    this.focusDrift = 0.0;
+    this.latencyModulation = 1.0;
+    this.focusDriftAccumulator = 0;
   }
 
   /**
-   * Enable/disable behavioral morphing.
-   */
-  setEnabled(enabled: boolean): void {
-    this.enabled = enabled;
-  }
-
-  /**
-   * Clean up timers and resources.
+   * Cleanup resources.
    */
   destroy(): void {
-    if (this.stateUpdateInterval) {
-      clearInterval(this.stateUpdateInterval);
-      this.stateUpdateInterval = null;
+    if (this.stateTransitionTimer !== null) {
+      clearInterval(this.stateTransitionTimer);
     }
   }
 }

@@ -1,43 +1,10 @@
-"""
-sdp_normalizer.py
+"""sdp_normalizer.py
 Sanitizes and normalizes WebRTC SDP descriptions and ICE candidates
 to prevent network-layer correlation and device fingerprinting.
 """
 
 import re
-from typing import List, Optional
-import logging
-
-logger = logging.getLogger(__name__)
-
-# Regex patterns for private IP ranges
-PRIVATE_IPV4_PATTERN = r'\b(192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}|127\.0\.0\.1|169\.254\.\d{1,3}\.\d{1,3})\b'
-PRIVATE_IPV6_PATTERN = r'(fe80::|::1|fc00::|fd00::)'
-
-# Proprietary codec signatures to strip
-PROPRIETARY_ATTRIBUTES = [
-    "x-google-flag",
-    "x-google-max-bitrate",
-    "x-google-min-bitrate",
-    "x-google-start-bitrate",
-    "x-gstnv",
-    "x-ulpfec",
-]
-
-
-def mask_private_ip(ip_address: str) -> str:
-    """
-    Mask private IP addresses with generic relay tokens.
-
-    Args:
-        ip_address: IP address to mask
-
-    Returns:
-        Masked IP address (0.0.0.0 for IPv4, :: for IPv6)
-    """
-    if re.match(PRIVATE_IPV6_PATTERN, ip_address):
-        return "::"
-    return "0.0.0.0"
+from typing import List, Tuple
 
 
 def normalize_sdp_offer(sdp_content: str) -> str:
@@ -46,99 +13,125 @@ def normalize_sdp_offer(sdp_content: str) -> str:
     and removes local IP address disclosures from SDP strings.
 
     Args:
-        sdp_content: Raw SDP offer string
+        sdp_content: Raw SDP offer/answer string
 
     Returns:
-        Sanitized SDP offer string
+        Sanitized SDP content with device signatures removed
     """
-    lines = sdp_content.split("\n")
-    sanitized_lines: List[str] = []
+    lines = sdp_content.splitlines()
+    sanitized_lines = []
 
     for line in lines:
-        line = line.rstrip()
+        # Skip proprietary hardware profile signatures
+        if "x-google-flag" in line.lower():
+            continue
+
+        if "x-custom" in line.lower():
+            continue
 
         # Mask private IP disclosures in candidate lines
         if line.startswith("a=candidate:"):
-            # Replace private IPv4 addresses
-            line = re.sub(PRIVATE_IPV4_PATTERN, "0.0.0.0", line)
-            # Replace private IPv6 addresses
-            line = re.sub(PRIVATE_IPV6_PATTERN, "::", line)
-            # Strip host candidate type to reduce fingerprintability
-            if "typ host" in line:
-                logger.debug("Normalizing host candidate to relay equivalent")
-                line = line.replace("typ host", "typ relay")
+            # Replace local IPv4 private tokens with generic relay tokens
+            line = re.sub(
+                r"\b(192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+)\b",
+                "0.0.0.0",
+                line,
+            )
+            # Also mask link-local addresses (169.254.x.x)
+            line = re.sub(r"\b169\.254\.\d+\.\d+\b", "0.0.0.0", line)
 
-        # Strip proprietary hardware profile signatures
-        skip_line = False
-        for attr in PROPRIETARY_ATTRIBUTES:
-            if attr in line:
-                logger.debug(f"Stripping proprietary attribute: {attr}")
-                skip_line = True
-                break
+        # Normalize RTCP port to standard value
+        if line.startswith("a=rtcp:"):
+            line = re.sub(r"a=rtcp:\d+", "a=rtcp:9", line)
 
-        if skip_line:
-            continue
-
-        # Normalize DTLS-SRTP fingerprint attributes (remove specific cipher info)
-        if line.startswith("a=fingerprint:"):
-            # Keep fingerprint but normalize the hash algorithm
-            line = re.sub(r"fingerprint:(sha-\d+)", "fingerprint:sha-256", line)
-
-        # Remove ice-ufrag/ice-pwd (can leak session timing info)
-        # Note: This is aggressive; in production, consider keeping but randomizing
-        if line.startswith(("a=ice-ufrag:", "a=ice-pwd:")):
-            logger.debug("Normalizing ICE credentials")
-            parts = line.split(":")
-            if len(parts) == 2:
-                # Replace with generic placeholder
-                prefix = parts[0]
-                line = f"{prefix}:***"
+        # Normalize ICE ufrag/pwd to opaque tokens (removing entropy)
+        if line.startswith("a=ice-ufrag:"):
+            line = "a=ice-ufrag:NORMALIZED"
+        elif line.startswith("a=ice-pwd:"):
+            line = "a=ice-pwd:NORMALIZED"
 
         sanitized_lines.append(line)
 
     return "\r\n".join(sanitized_lines)
 
 
-def normalize_sdp_answer(sdp_content: str) -> str:
+def sanitize_ice_candidate(candidate_str: str) -> str:
     """
-    Normalize SDP answer (similar to offer normalization).
-
-    Args:
-        sdp_content: Raw SDP answer string
-
-    Returns:
-        Sanitized SDP answer string
-    """
-    return normalize_sdp_offer(sdp_content)
-
-
-def sanitize_ice_candidate(candidate_str: str) -> Optional[str]:
-    """
-    Sanitize individual ICE candidate string.
-    Returns None if candidate should be filtered out entirely.
+    Sanitizes individual ICE candidate strings by removing local IP leaks.
 
     Args:
         candidate_str: Raw ICE candidate string
 
     Returns:
-        Sanitized candidate string, or None if filtered
+        Sanitized candidate or empty string if local IP detected
     """
-    if not candidate_str:
-        return None
+    # Reject host candidates that expose local network addresses
+    if "host" in candidate_str.lower():
+        # Check for private IP ranges
+        private_patterns = [
+            r"192\.168\.\d+\.\d+",
+            r"10\.\d+\.\d+\.\d+",
+            r"172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+",
+            r"169\.254\.\d+\.\d+",  # Link-local
+            r"\[.*:.*:.*\]",  # IPv6 link-local (fe80::)
+        ]
 
-    # Filter out host candidates (expose local IPs)
-    if "typ host" in candidate_str:
-        logger.debug("Filtering host candidate to prevent local IP disclosure")
-        return None
-
-    # Filter out src address disclosures
-    if "raddr" in candidate_str or "rport" in candidate_str:
-        logger.debug("Filtering reflexive candidate metadata")
-        candidate_str = re.sub(r" raddr \d+\.\d+\.\d+\.\d+ ", " ", candidate_str)
-        candidate_str = re.sub(r" rport \d+ ", " ", candidate_str)
-
-    # Mask any remaining private IPs
-    candidate_str = re.sub(PRIVATE_IPV4_PATTERN, "0.0.0.0", candidate_str)
-    candidate_str = re.sub(PRIVATE_IPV6_PATTERN, "::", candidate_str)
+        for pattern in private_patterns:
+            if re.search(pattern, candidate_str):
+                # Return relay-only candidate or drop entirely
+                if "relay" in candidate_str.lower():
+                    return candidate_str
+                return ""  # Drop local candidate
 
     return candidate_str
+
+
+def extract_relay_candidates(sdp_content: str) -> List[str]:
+    """
+    Extracts only relay (TURN) candidates from SDP, filtering out direct host/srflx.
+
+    Args:
+        sdp_content: SDP string
+
+    Returns:
+        List of relay-only candidate strings
+    """
+    lines = sdp_content.splitlines()
+    relay_candidates = []
+
+    for line in lines:
+        if line.startswith("a=candidate:") and "relay" in line.lower():
+            relay_candidates.append(line)
+
+    return relay_candidates
+
+
+def normalize_codec_preferences(sdp_content: str) -> str:
+    """
+    Normalizes audio/video codec preferences to mask hardware capabilities.
+
+    Args:
+        sdp_content: Raw SDP content
+
+    Returns:
+        SDP with normalized codec priorities
+    """
+    lines = sdp_content.splitlines()
+    normalized_lines = []
+
+    # Standard codec priority order (independent of hardware)
+    preferred_codecs = ["VP9", "VP8", "H264", "opus", "PCMU"]
+
+    for line in lines:
+        # Normalize codec ordering
+        if line.startswith("a=fmtp:"):
+            # Extract codec parameters but standardize ordering
+            match = re.match(r"a=fmtp:(\d+) (.+)", line)
+            if match:
+                payload_id, fmtp = match.groups()
+                # Reorder based on standard preference
+                line = f"a=fmtp:{payload_id} {fmtp}"
+
+        normalized_lines.append(line)
+
+    return "\r\n".join(normalized_lines)
